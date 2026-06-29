@@ -33,7 +33,7 @@ Cuando el usuario pida desplegar una nueva aplicación, el agente `@deploy` debe
 2. Sube la imagen construida al registro de contenedores de GitHub (`ghcr.io`).
 3. El runner `self-hosted` de la Raspberry Pi descarga la imagen final e inicia los contenedores instantáneamente, sin necesidad de compilar nada localmente.
 *Referencia:* Plantilla `templates/deploy-ghcr-build.template.yml`.
-
+Hay que revisar este paso B para que se ejecute en otra raspberry donde tengamos un registry de imagenes, automatizando el pull y run de la imagen en la raspberry pi con traeffic.
 ---
 
 ## 🏷️ 3. Directrices de Traefik y Puertos
