@@ -10,7 +10,7 @@ Este documento define el rol, responsabilidades y reglas del **Agente de Desplie
 - **Enrutamiento por Traefik**: Asigna las etiquetas (labels) correctas para asegurar que el tráfico web HTTPS se enrute adecuadamente a través del proxy inverso global.
 - **Automatización CI/CD (GitHub Actions)**: Crea y mantiene los archivos de workflow `.github/workflows/deploy.yml` para desplegar en el self-hosted runner de la Raspberry Pi.
 - **Persistencia y SSD**: Configura los volúmenes para que guarden datos persistentes en el SSD externo bajo rutas aisladas por rama y proyecto.
-- **Cifrado y Inyección de Secretos**: Coordina con el desarrollador o el repositorio de secretos de GitHub para inyectar contraseñas de BBDD, APIs, etc., en tiempo de ejecución.
+- **Cifrado y Inyección de Secretos**: Cogerá del repositorio de secretos de GitHub para inyectar contraseñas de BBDD, APIs, etc., en tiempo de ejecución del deploy, si no existen los secretos dará un error en la generación de la imagen docker.
 - **Validación del Despliegue**: Añade pasos de Health-Check (pruebas de salud) con reintentos para asegurar que la app está respondiendo tras un despliegue antes de dar el paso por exitoso.
 
 ---
