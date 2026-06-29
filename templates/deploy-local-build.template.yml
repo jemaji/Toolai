@@ -1,0 +1,92 @@
+# 🐙 GitHub Actions Workflow — Construcción Local en la Pi (Flujo A)
+#
+# INSTRUCCIONES:
+# 1. Copia este archivo a `.github/workflows/deploy.yml` de tu repositorio.
+# 2. Configura los secretos correspondientes en GitHub Settings > Secrets > Actions:
+#    - `DB_USER`, `DB_PASS`, `DB_NAME`, `AUTH_SECRET`, etc.
+# 3. Cambia las ocurrencias de `[appname]` por el identificador de tu aplicación.
+# 4. Asegura que tu runner de GitHub local esté activo y etiquetado como `self-hosted`.
+
+name: Deploy to Raspberry Pi (Local Build)
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+
+jobs:
+  deploy:
+    name: Deploy to Pi
+    runs-on: self-hosted # Obliga a ejecutar los comandos físicamente dentro de la Raspberry Pi
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Determine Branch & Set Vars
+        id: vars
+        run: |
+          BRANCH_NAME=${GITHUB_REF#refs/heads/}
+          echo "branch=${BRANCH_NAME}" >> $GITHUB_OUTPUT
+          
+          # Configuración del subdominio de Traefik y entornos
+          if [[ "${BRANCH_NAME}" == "main" ]]; then
+            echo "DOMAIN=[appname].20112013.xyz" >> $GITHUB_ENV
+          else
+            echo "DOMAIN=${BRANCH_NAME}-[appname].20112013.xyz" >> $GITHUB_ENV
+          fi
+
+      - name: Create Environment Variables (.env)
+        run: |
+          # 1. Codificar la contraseña para la conexión URL (evita problemas con caracteres especiales @ / :)
+          # python3 viene preinstalado nativamente en Raspberry Pi OS / Debian
+          DB_PASS_ENCODED=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "${{ secrets.DB_PASS }}")
+          
+          # 2. Escribir variables al archivo .env
+          echo "BRANCH=${{ steps.vars.outputs.branch }}" > .env
+          echo "DOMAIN=${{ env.DOMAIN }}" >> .env
+          
+          echo "DB_USER=${{ secrets.DB_USER }}" >> .env
+          echo "DB_PASS=${{ secrets.DB_PASS }}" >> .env
+          echo "DB_NAME=${{ secrets.DB_NAME }}" >> .env
+          echo "DB_PASS_ENCODED=${DB_PASS_ENCODED}" >> .env
+          
+          echo "AUTH_SECRET=${{ secrets.AUTH_SECRET }}" >> .env
+          # (Añadir otros secretos aquí...)
+
+      - name: Deploy with Docker Compose
+        run: |
+          # Levanta los contenedores compilando en el procesador local ARM64 de la Pi
+          # Se aísla por proyecto Docker a nivel de rama usando '-p'
+          docker compose \
+            -p [appname]-${{ steps.vars.outputs.branch }} \
+            -f docker-compose.prod.yml \
+            --env-file .env \
+            up -d --build --remove-orphans
+
+      - name: Run Database Migrations
+        run: |
+          # Si tienes un perfil de herramientas o seeder en Compose para Prisma / Migraciones:
+          docker compose \
+            -p [appname]-${{ steps.vars.outputs.branch }} \
+            -f docker-compose.prod.yml \
+            --env-file .env \
+            run --rm seeder
+
+      - name: Health Check Verification
+        run: |
+          echo "Iniciando verificación de disponibilidad de la app..."
+          # Realiza un bucle de comprobaciones locales de HTTP con intervalo de espera
+          # [puerto-local-debug] es el puerto mapeado en localhost en tu docker-compose.prod.yml
+          for i in 1 2 3 4 5; do
+            sleep 5
+            if curl -sf http://127.0.0.1:[puerto-local-debug]/api/health; then
+              echo "✅ Despliegue exitoso — ¡La aplicación responde!"
+              exit 0
+            fi
+            echo "Intento $i/5 — esperando a que la app responda..."
+          done
+          echo "❌ Error: El servicio no respondió a tiempo."
+          docker compose -p [appname]-${{ steps.vars.outputs.branch }} -f docker-compose.prod.yml logs --tail=50 app
+          exit 1

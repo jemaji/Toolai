@@ -1,0 +1,127 @@
+# 🐳 Plantilla Docker Compose — Despliegue en Raspberry Pi
+#
+# REEMPLAZAR LOS PLACEHOLDERS:
+#   - [appname]: Nombre único de tu aplicación (ej: procedix, electro)
+#   - [puerto-interno]: Puerto en el que escucha tu app dentro del contenedor (ej: 3000)
+#   - [puerto-local-debug]: Puerto externo en la Pi para depuración en localhost (ej: 3001)
+#   - [puerto-postgres-debug]: Puerto local desocupado en la Pi para psql directo (ej: 5435)
+#   - [puerto-redis-debug]: Puerto local desocupado en la Pi para redis-cli directo (ej: 6385)
+#
+# USO EN CI/CD:
+#   docker compose -p [appname]-${BRANCH} -f docker-compose.prod.yml --env-file .env up -d --build --remove-orphans
+
+networks:
+  # Red interna del proyecto para que los contenedores se hablen de forma segura
+  [appname]_internal:
+    driver: bridge
+  # Red externa global de Traefik
+  proxy:
+    external: true
+
+services:
+  # ─── Base de Datos PostgreSQL ───────────────────────────────────────────────
+  postgres:
+    image: postgres:16-bookworm
+    container_name: [appname]_postgres_${BRANCH:-dev}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-sat_user}
+      POSTGRES_PASSWORD: ${DB_PASS:-sat_pass}
+      POSTGRES_DB: ${DB_NAME:-sat_db}
+    volumes:
+      # ⚠️ CRÍTICO: usar SSD externo con aislamiento de rama para persistencia
+      - /mnt/ssd/[appname]/${BRANCH:-dev}/postgres:/var/lib/postgresql/data
+    ports:
+      # Solo expuesto localmente en la Raspberry Pi para debugging/trazabilidad
+      - "127.0.0.1:${DB_PORT:-[puerto-postgres-debug]}:5432"
+    networks:
+      - [appname]_internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-sat_user} -d ${DB_NAME:-sat_db}"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # ─── Servidor Caché Redis ───────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: [appname]_redis_${BRANCH:-dev}
+    restart: unless-stopped
+    command: >
+      sh -c "if [ -z \"$${REDIS_PASS}\" ]; then
+        exec redis-server --save 60 1 --loglevel warning;
+      else
+        exec redis-server --save 60 1 --loglevel warning --requirepass \"$${REDIS_PASS}\";
+      fi"
+    volumes:
+      - /mnt/ssd/[appname]/${BRANCH:-dev}/redis:/data
+    ports:
+      # Solo expuesto localmente para depuración
+      - "127.0.0.1:${REDIS_PORT:-[puerto-redis-debug]}:6379"
+    networks:
+      - [appname]_internal
+    healthcheck:
+      test: ["CMD-SHELL", "if [ -z \"$${REDIS_PASS}\" ]; then redis-cli ping; else redis-cli -a \"$${REDIS_PASS}\" ping; fi"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  # ─── Aplicación Core (Next.js / Node / etc.) ───────────────────────────────
+  app:
+    # Si construyes localmente (Flujo A), apunta al Dockerfile:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # Si descargas de GHCR (Flujo B), apunta a la imagen remota:
+    # image: ghcr.io/[user]/[appname]:latest
+    container_name: [appname]_app_${BRANCH:-dev}
+    restart: unless-stopped
+    env_file:
+      # Mapeos opcionales para evitar fallos catastróficos en arranque si no existen
+      - path: .env
+        required: false
+      - path: .env.local
+        required: false
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${DB_USER}:${DB_PASS_ENCODED}@postgres:5432/${DB_NAME}
+      REDIS_URL: redis://:${REDIS_PASS:-}@redis:6379
+      # (Inyectar otras variables de entorno de producción aquí...)
+    volumes:
+      # Mapeo de almacenamiento para cargas e imágenes
+      - /mnt/ssd/[appname]/${BRANCH:-dev}/uploads:/app/public/uploads
+    networks:
+      - [appname]_internal
+      - proxy # Red de Traefik
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      # Opcional: Puerto local accesible desde la Pi (ej: para curl en healthchecks)
+      - "127.0.0.1:[puerto-local-debug]:[puerto-interno]"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=proxy"
+      
+      # Regla de Dominio: main en root, dev en dev-[appname]
+      - "traefik.http.routers.[appname]-${BRANCH:-dev}.rule=Host(`${DOMAIN:-dev-[appname].20112013.xyz`)"
+      - "traefik.http.routers.[appname]-${BRANCH:-dev}.entrypoints=web,websecure"
+      - "traefik.http.routers.[appname]-${BRANCH:-dev}.tls=true"
+      - "traefik.http.routers.[appname]-${BRANCH:-dev}.tls.certresolver=myresolver"
+      
+      # Redirección de puerto interno expuesto por tu servidor web en el contenedor
+      - "traefik.http.services.[appname]-${BRANCH:-dev}.loadbalancer.server.port=[puerto-interno]"
+    deploy:
+      resources:
+        limits:
+          memory: 512M

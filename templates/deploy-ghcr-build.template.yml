@@ -1,0 +1,168 @@
+# 🐙 GitHub Actions Workflow — Construcción Remota en GHA y Pull en la Pi (Flujo B)
+#
+# INSTRUCCIONES:
+# 1. Copia este archivo a `.github/workflows/deploy.yml` de tu repositorio.
+# 2. Habilita los permisos de escritura del `GITHUB_TOKEN` en GitHub Settings > Actions > General (Read & Write permissions).
+# 3. Configura los secretos correspondientes en GitHub Settings > Secrets > Actions:
+#    - `DB_USER`, `DB_PASS`, `DB_NAME`, `AUTH_SECRET`, etc.
+# 4. Reemplaza `[user]`, `[appname]`, y los puertos según corresponda.
+
+name: Deploy to Raspberry Pi (GHCR Build & Pull)
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+
+jobs:
+  # ─── Etapa 1: Pruebas unitarias, Lint y validaciones (Dry-Run) ───────────────
+  test:
+    name: Lint, Test & Compile check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Opcional: Generación de esquemas (ej: Prisma) antes de lint/test
+      # - name: Generate DB Client
+      #   run: npx prisma generate
+
+      - name: Run Lint
+        run: npm run lint --if-present
+
+      - name: Run Unit Tests
+        run: npm run test --if-present
+
+  # ─── Etapa 2: Construcción multiplataforma ARM64 y subida a GHCR ─────────────
+  build-and-push:
+    name: Build & Push Image to GHCR
+    runs-on: ubuntu-latest
+    needs: test
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up QEMU (para emulación ARM64 en runner x86)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & Push Production Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          # Etiqueta con 'latest' y con el SHA del commit para trazabilidad e inmutabilidad
+          tags: |
+            ghcr.io/[user]/[appname]:latest
+            ghcr.io/[user]/[appname]:${{ github.sha }}
+          # Uso de caché de GitHub Actions para acelerar builds subsiguientes
+          cache-from: type=gha,scope=[appname]
+          cache-to: type=gha,mode=max,scope=[appname]
+          # Compilación nativa cruzada para el procesador ARM64 de la Raspberry Pi
+          platforms: linux/arm64
+
+  # ─── Etapa 3: Despliegue e inicialización física en la Raspberry Pi ──────────
+  deploy:
+    name: Deploy to Pi (Self-Hosted)
+    runs-on: self-hosted
+    needs: build-and-push
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log into GitHub Container Registry (GHCR) en la Pi
+        run: |
+          # Login local usando la sesión del runner
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Pull latest Docker images
+        run: |
+          # Forzar descarga de la nueva imagen compilada antes de levantar
+          docker pull ghcr.io/[user]/[appname]:latest
+
+      - name: Determine Branch & Set Vars
+        id: vars
+        run: |
+          BRANCH_NAME=${GITHUB_REF#refs/heads/}
+          echo "branch=${BRANCH_NAME}" >> $GITHUB_OUTPUT
+          
+          if [[ "${BRANCH_NAME}" == "main" ]]; then
+            echo "DOMAIN=[appname].20112013.xyz" >> $GITHUB_ENV
+          else
+            echo "DOMAIN=${BRANCH_NAME}-[appname].20112013.xyz" >> $GITHUB_ENV
+          fi
+
+      - name: Create Environment Variables (.env)
+        run: |
+          # 1. URL encoding de contraseñas complejas
+          DB_PASS_ENCODED=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "${{ secrets.DB_PASS }}")
+          
+          # 2. Escribir variables al archivo .env
+          echo "BRANCH=${{ steps.vars.outputs.branch }}" > .env
+          echo "DOMAIN=${{ env.DOMAIN }}" >> .env
+          
+          echo "DB_USER=${{ secrets.DB_USER }}" >> .env
+          echo "DB_PASS=${{ secrets.DB_PASS }}" >> .env
+          echo "DB_NAME=${{ secrets.DB_NAME }}" >> .env
+          echo "DB_PASS_ENCODED=${DB_PASS_ENCODED}" >> .env
+          
+          echo "AUTH_SECRET=${{ secrets.AUTH_SECRET }}" >> .env
+          # (Añadir otros secretos aquí...)
+
+      - name: Restart Services with Docker Compose
+        run: |
+          # Levanta la app descargando la imagen de GHCR (ya pre-compilada en ARM64)
+          docker compose \
+            -p [appname]-${{ steps.vars.outputs.branch }} \
+            -f docker-compose.prod.yml \
+            --env-file .env \
+            up -d --remove-orphans
+
+      - name: Run Database Migrations
+        run: |
+          # Si tienes un perfil o contenedor de base de datos/migrations
+          docker compose \
+            -p [appname]-${{ steps.vars.outputs.branch }} \
+            -f docker-compose.prod.yml \
+            --env-file .env \
+            run --rm seeder
+
+      - name: Health Check Verification
+        run: |
+          echo "Iniciando verificación de disponibilidad de la app..."
+          for i in 1 2 3 4 5; do
+            sleep 5
+            if curl -sf http://127.0.0.1:[puerto-local-debug]/api/health; then
+              echo "✅ Despliegue exitoso — ¡La aplicación responde!"
+              exit 0
+            fi
+            echo "Intento $i/5 — esperando a que la app responda..."
+          done
+          echo "❌ Error: El servicio no respondió a tiempo."
+          docker compose -p [appname]-${{ steps.vars.outputs.branch }} -f docker-compose.prod.yml logs --tail=50 app
+          exit 1
